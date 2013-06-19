@@ -1,0 +1,5 @@
+*.swp
+*~
+dump.rdb
+node_modules/
+public/
