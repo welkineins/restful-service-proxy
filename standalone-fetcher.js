@@ -37,7 +37,7 @@ var serviceFetchingQueue = async.queue(function(task, callback) {
 	request.get(task.module_url, function(err, res, body) {
 
 		if(err || res.statusCode != 200) {
-			console.log("[Error] Can't fetch service module: " + err);
+			console.log("[Error] Can't fetch service module: " + (err || res.statusCode));
 			callback();
 		}
 	}).pipe(fs.createWriteStream(module_tmp_path)).on("error", function(err) {
@@ -85,21 +85,6 @@ var serviceFetchingQueue = async.queue(function(task, callback) {
 							callback();
 							return;
 						}
-				
-						// Fire to fetch utlity functions specified in service policy
-						["responseTime", "dataTransferSize", "resultFidelity"].forEach(function(url) {
-							if(info.policy.typeParameter.hasOwnProperty(url)) {
-								rdb.get("utility:" + info.policy.typeParameter[url], function(err, reply) {
-									if(err) {
-										console.log("[Error] Lookup utility in service policy failed: " + err);
-										return;
-									}
-									if( ! reply) {
-										getUtility(info.policy.typeParameter[url]);		
-									}
-								});
-							}
-						});
 
 						// Do next task directly, without waiting tasks of utility functions.
 						console.log("[Info] Caching new service module & policy [" + key + "]");
@@ -117,9 +102,7 @@ function getModule(opt) {
 
 	if(typeof linkHeader != "undefined") {
 		var parsed = linkParser(linkHeader);
-		if(parsed.module && parsed.module.url  
-			&& parsed.policy && parsed.policy.url) {
-
+		if(parsed.module && parsed.module.url && parsed.policy && parsed.policy.url) {
 			// create a new task into a queue and schedule to download
 			serviceFetchingQueue.push({
 				host: query, 
@@ -137,7 +120,7 @@ function getModule(opt) {
 var utilityFetchingQueue = async.queue(function(task, callback) {
 	request.get(task.url, function(err, res, body) {
 		if(err || res.statusCode != 200) {
-			console.log("[Error] Fail to fetch utility: " + err + '/' + res.statusCode);
+			console.log("[Error] Fail to fetch utility: " + (err || res.statusCode));
 			callback();
 	    	return;
 	    }
@@ -151,9 +134,9 @@ var utilityFetchingQueue = async.queue(function(task, callback) {
 	});
 }, 2); // 2 concurrent
 
-function getUtility(url) {
+function getUtility(opt) {
 	utilityFetchingQueue.push({
-		url: url,
+		url: opt.url,
 	});
 }
 
@@ -174,3 +157,4 @@ process.on("message", function(msg) {
 	}
 });
 
+/* End of file standalone-fetcher.js */

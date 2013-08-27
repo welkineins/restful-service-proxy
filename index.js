@@ -1,14 +1,12 @@
 var httpProxy  = require('http-proxy'),
 	url        = require('url'),
 	redis      = require('redis'),
-	fs         = require('fs'),
-	_          = require('underscore'),
 	os         = require('os'),
 	vm         = require('vm'),
 	regEscape  = require('escape-regexp'),
-	userPolicy = require('./lib/user-policy-header-parser.js'),
-	router     = require('router'),
-	child      = require('child_process');
+	userPolicyParser = require('./lib/user-policy-header-parser.js'),
+	child      = require('child_process'),
+	utility    = require('./lib/utility.js');
 
 var proxyPort     = 8000,
 	runtimePort   = 6666,
@@ -50,15 +48,12 @@ setInterval(function resourceMonitor() {
 	}
 
 	resourceFlag = true;
-}, 1000); //ms
+}, 100); //ms
 
 function resourceCheck(info) {
 	if( ! resourceFlag) {
 		return false;
 	}
-
-	//TODO resource check
-
 	return true;
 }
 
@@ -69,18 +64,48 @@ function resourceCheck(info) {
 // service ready to run, otherwise, it should forward 
 // the reques.
 // -----------------------------------------------------
-//TODO 一個完整的計算方法
-function firstUtilityCheck(utilities) {
-	var sandbox = {
-		responseTime: 0
-	};
-	vm.runInNewContext(utilities[3] + "responseTime = func(50);", sandbox);
-	
-	if(sandbox.responseTime < 0.3) {
-		return false;
+
+// Calculate cumulative attribute values and estimated 
+// attribute value. Then we can calculate expected utility 
+// valus u^proxy, u^cloud.
+function utilityCheck(utilities, req, policy, service) {
+	if(req.url.match(/mashup\/do/)) {
+		return true;
 	}
 
-	return true;
+	if(policy["no-forward"]) {
+		console.log("[INFO] No-forward flag on");
+		return true;
+	}
+
+	req.utility.setTimeUtilityFunction(new Function(["t"], utilities[0] + ";return func(t);"));
+	req.utility.setTransferDataUtilityFunction(new Function(["d"], utilities[1] + ";return func(d);"));
+	req.utility.setCurrentTime();
+	req.utility.setReqData(parseInt(req.headers["content-length"]));
+
+	var proxyTime1 = parseInt(policy.pt1) || 0.08,
+		cloudTime1 = parseInt(policy.ct1) || 0.036
+		proxyTime2 = parseInt(policy.pt2) || 1.31,
+		cloudTime2 = parseInt(policy.ct2) || 1.26;
+
+	var ptime = (req.url.match(/preprocess$/)) ? proxyTime1 : proxyTime2,
+		ctime = (req.url.match(/preprocess$/)) ? cloudTime1 : cloudTime2;
+
+	var upstreamUtility = req.utility.calcUtilityAtUpstream({
+		time: ctime,
+		reqData: parseInt(req.headers["content-length"]),
+		resData: parseInt(req.headers["content-length"]),
+	});
+	
+	var proxyUtility = req.utility.calcUtilityAtProxy({
+		time: ptime,
+		transferData: 0,
+		transferNum: 0,
+	});
+	
+	console.log("[INFO] utility: " + JSON.stringify([proxyUtility, upstreamUtility]));
+
+	return (proxyUtility >= upstreamUtility);
 }
 
 // -- Proxying
@@ -95,13 +120,31 @@ function firstUtilityCheck(utilities) {
 // --------------------------------------------------------
 
 function forward(proxy, req, res, proxyOpt) {
+	/*if(req.userPolicy["no-forward"]) {
+		res.writeHead(440, {"Content-Length": "0"}); // an unused status code
+		res.end();
+		return;
+	}*/
 	proxy.proxyRequest(req, res, proxyOpt);
 }
 
-process.setMaxListeners(0);
 httpProxy.setMaxSockets(1024);
+var server = httpProxy.createServer(function(req, res, next) {
+	// Security check
+	var ips = [
+		"140.113.216.105",
+		"140.113.235.158",
+		"140.113.235.157",
+		"127.0.0.1",
+	];
 
-var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
+	ips.forEach(function(ip){
+		if(req.connection.remoteAddress == ip) {
+			next();
+			return false;
+		}
+	});
+}, function(req, res, proxy) { // HTTP Proxy
 	var query  = url.parse(req.url),
 	    buffer = httpProxy.buffer(req),
 		proxyOpt = {
@@ -111,14 +154,23 @@ var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
 		};
 
 	// Check user preference
-	var userPolicies   = userPolicy.parse(req.headers["user-policy"]);
-	if(userPolicies["no-served"]) {
+	req.utility    = utility.createUtility();
+	req.userPolicy = userPolicyParser.parse(req.headers["user-policy"]);
+	
+	if(req.userPolicy["no-served"]) {
 		// This flag can prevent down module and policy again
-		res.lcoal_served = true;
+		res.local_served = true;
 		forward(proxy, req, res, proxyOpt);
 		console.log("[Info] Forwarded since no-served flag found.");
 		return;
 	}
+
+	// Initialize attributes of resopnse time and transfer data
+	req.userPolicy.t = parseInt(req.userPolicy.t) || 0;
+	req.userPolicy.d = parseInt(req.userPolicy.d) || 0;
+	req.utility.setCumulativeTime(req.userPolicy.t);
+	req.utility.setCumulativeData(req.userPolicy.d);
+	req.utility.setStartTime();
 
 	// Look up local services by key which is a domain/host 
 	var key = "service:" + query.protocol + "//" + query.host + "*";
@@ -161,10 +213,13 @@ var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
 			}
 
 			// This flag can prevent down module and policy again
-			res.lcoal_served = true;
+			res.local_served = true;
 
 			var info = JSON.parse(reply);
-						
+
+			// PRE-CONDITIONS CHECK
+			// --------------------
+
 			// Check resources status and user preferences to make
 			// sure that user take benefit from running service
 			// locally.
@@ -175,16 +230,15 @@ var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
 			}
 			
 
+			// UTILITY CHECK
+			// --------------------
+
 			// Next, we query all provided utility functions from redis to check
 			// whether executing local service can provide better utility or not.
 			// If not, then we should not do it.
 			var utilities = [
-				"utility:" + (info.policy.typeParameter.responseTime || 'default'),
-				"utility:" + (info.policy.typeParameter.dataTransferSize || 'default'),
-				"utility:" + (info.policy.typeParameter.resultFidelity || 'default'),
-				"utility:" + (userPolicies.responseTime || 'default'),
-				"utility:" + (userPolicies.dataTransferSize || 'default'),
-				"utility:" + (userPolicies.resultFidelity || 'default'),
+				"utility:" + req.userPolicy.responseTime,
+				"utility:" + req.userPolicy.dataTransferSize,
 			]; 
 
 			rdb.mget(utilities, function(err, reply) {
@@ -205,13 +259,13 @@ var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
 				};
 
 				if( ! test) {
-					console.log("[Error] Some utility function not found, downloading, forwarded");
+					console.log("[Info] Some utility function not found, downloading, forwarded: " + query.href);
 					forward(proxy, req, res, proxyOpt);
 					return;                                                       
 				}
 
 				// early utilty cehck
-				if( ! firstUtilityCheck(reply)) {
+				if( ! utilityCheck(reply, req, req.userPolicy, info)) {
 					console.log("[Warn] Utility check failed, forwarded: " + query.href);
 					forward(proxy, req, res, proxyOpt);
 					return;
@@ -219,16 +273,19 @@ var server = httpProxy.createServer(function(req, res, proxy) { // HTTP Proxy
 
 				// Yes, that's serve locally. Passing info data to local
 				// service runtime by storing them in the request header.
-				info.proxy = "http://127.0.0.1:" + proxyPort;
-				info.utility = reply;
-				req.headers["x-service-execution"] = JSON.stringify(info);
+				var msg = {
+					service: info,
+					proxy: "http://127.0.0.1:" + proxyPort,
+					userPolicy: req.userPolicy,
+					utility: req.utility.toString(),
+				};
+				req.headers["x-service-execution"] = JSON.stringify(msg);
 				
 				proxy.proxyRequest(req, res, {
 					host: "127.0.0.1",
 				    port: runtimePort,
 				    buffer: buffer
 				});
-
 			}); // mget
 		}); // get
 	}); // keys
@@ -246,10 +303,9 @@ var fetcher = child.fork("./standalone-fetcher.js", [moduleTmpPath, modulePath])
 // generated (finish proxying). We check whether to fetch service
 // module, policy, utility function or not there.
 server.proxy.on("end", function(req, res, response) {
-
 	// if this service response is generated by local server,
 	// we don't need to fetch them
-	if(res.lcoal_served) {
+	if(res.local_served) {
 		return;
 	}
 
@@ -274,5 +330,16 @@ function getUtility(url) {
 // -- Start Proxying
 // ------------------------------------------------------
 var runtime = child.fork("./standalone-runtime.js", [runtimePort]);
-server.listen(proxyPort);
+server.listen(proxyPort, function() {
+	console.log("P-Proxy is running on port: " + proxyPort + " (runtime: " + runtimePort + ")");
+});
+
+// -- End of Proxy
+// ------------------------------------------------------
+process.on("exit", function() {
+	fetcher.kill("SIGKILL");
+	runtime.kill("SIGKILL");
+});
+
+/* End of file index.js */
 
